@@ -30,6 +30,12 @@
       <version>${project.version}</version>
       <scope>compile</scope>
     </dependency>
+      <dependency>
+        <groupId>org.fcrepo</groupId>
+        <artifactId>fcrepo-example</artifactId>
+        <version>${project.version}</version>
+        <scope>compile</scope>
+      </dependency>
     <dependency>
       <groupId>org.fcrepo</groupId>
       <artifactId>fcrepo-dc</artifactId>
@@ -81,7 +87,33 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-war-plugin</artifactId>
       </plugin>
-      <plugin>
+        <plugin>
+             <groupId>org.apache.maven.plugins</groupId>
+             <artifactId>maven-dependency-plugin</artifactId>
+             <executions>
+                 <execution>
+                     <id>copy-wars</id>
+                     <phase>package</phase>
+                     <goals>
+                         <goal>copy</goal>
+                     </goals>
+
+                     <configuration>
+                         <outputDirectory>${project.build.directory}/testwars</outputDirectory>
+                         <stripVersion>true</stripVersion>
+                         <artifactItems>
+                             <artifactItem>
+                                 <groupId>org.apache.solr</groupId>
+                                 <artifactId>solr</artifactId>
+                                 <version>4.1.0</version>
+                                 <type>war</type>
+                             </artifactItem>
+                         </artifactItems>
+                     </configuration>
+                 </execution>
+            </executions>
+         </plugin>
+        <plugin>
         <groupId>org.mortbay.jetty</groupId>
         <artifactId>jetty-maven-plugin</artifactId>
         <version>8.1.9.v20130131</version>
@@ -90,6 +122,22 @@
           <webApp>
             <contextPath>/</contextPath>
           </webApp>
+            <contextHandlers>
+                        <contextHandler implementation="org.eclipse.jetty.webapp.WebAppContext">
+                          <war>${project.build.directory}/testwars/solr.war</war>
+                          <contextPath>/solr</contextPath>
+                        </contextHandler>
+          </contextHandlers>
+            <systemProperties>
+               <systemProperty>
+                   <name>solr.solr.home</name>
+                   <value>${basedir}/../fcrepo-example/src/main/solr/home</value>
+               </systemProperty>
+               <systemProperty>
+                   <name>solr.data.dir</name>
+                   <value>${project.build.directory}/solr/data</value>
+               </systemProperty>
+           </systemProperties>
         </configuration>
       </plugin>
     </plugins>
