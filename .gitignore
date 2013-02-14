@@ -9,3 +9,6 @@ indexes/
 ObjectStore/
 */.cache
 .cache
+*.iml
+*.iws
+.idea/
