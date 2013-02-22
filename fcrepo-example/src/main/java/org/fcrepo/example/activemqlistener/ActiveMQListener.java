@@ -1,6 +1,7 @@
 package org.fcrepo.example.activemqlistener;
 
 import org.apache.abdera.Abdera;
+import org.apache.abdera.model.Category;
 import org.apache.abdera.model.Entry;
 import org.apache.activemq.ActiveMQConnectionFactory;
 import org.apache.solr.client.solrj.SolrServer;
@@ -8,10 +9,8 @@ import org.apache.solr.client.solrj.impl.HttpSolrServer;
 import org.apache.solr.common.SolrInputDocument;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.w3c.dom.Document;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
-import org.xml.sax.SAXException;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
@@ -26,9 +25,10 @@ import javax.jms.TextMessage;
 import javax.security.auth.login.LoginException;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
-import java.io.IOException;
+import java.io.ByteArrayInputStream;
+import java.io.StringReader;
 import java.net.URL;
-import java.net.URLConnection;
+import java.util.List;
 
 /**
  * Simply listens to active MQ and updates SOLR
@@ -68,21 +68,16 @@ public class ActiveMQListener {
    	}
 
     public SolrInputDocument solrDocumentFromFedoraId(String id) throws Exception {
-        //TODO: Even more harcoded and hackish. Use decent REST framework instead of this abomination!
-        String dc = new URL("http://localhost:8080/rest/" + id + "/datastreams/DC/").openConnection().getContent()
-                .toString();
-        return solrDocumentFromDC(id, dc);
-    }
-
-    private SolrInputDocument solrDocumentFromDC(String id, String dc) throws SAXException, IOException {
         SolrInputDocument doc = new SolrInputDocument();
         doc.addField("id", id);
-        Document document = documentBuilder.parse(dc);
-        // Should actually understand the dc...
-        NodeList dcNodes = document.getDocumentElement().getFirstChild().getChildNodes();
+        //TODO: Even more hardcoded and hackish. Use decent REST framework instead of this abomination!
+        URL dcUrl = new URL("http://localhost:8080/rest/objects/" + id + "/datastreams/DC/content");
+        org.w3c.dom.Document document = documentBuilder.parse(dcUrl.toString());
+        //TODO Should actually understand the dc...
+        NodeList dcNodes = document.getDocumentElement().getElementsByTagName("*");
         for (int i = 0; i < dcNodes.getLength(); i++) {
             Node dcNode = dcNodes.item(i);
-            doc.addField(dcNode.getNodeName(), dcNode.getTextContent());
+            doc.addField(dcNode.getNodeName().substring(dcNode.getNodeName().indexOf(':') + 1), dcNode.getTextContent());
         }
         return doc;
     }
@@ -92,18 +87,28 @@ public class ActiveMQListener {
         public void onMessage(Message message) {
             try {
                 String text = ((TextMessage) message).getText();
-                Entry entry = new Abdera().newEntry();
-                entry.setContent(text);
-                String id = entry.getId().toString();
+                Entry entry = new Abdera().getParser().<Entry>parse(new StringReader(text)).getRoot();
+                List<Category> categories = entry.getCategories();
+                String id = null;
+                for (Category c : categories) {
+                    if (c.getLabel().equals("fedora-types:pid")) {
+                        id = c.getTerm();
+                        break;
+                    }
+                }
+                if (id == null) {
+                    logger.debug("Received message not added to SOLR, no ID found: {}", message);
+                }
                 SolrInputDocument doc = solrDocumentFromFedoraId(id);
                 if (doc != null) {
                     server.add(doc);
+                    server.commit();
                 }
             } catch (JMSException e) {
                 logger.debug("Received message not understood: {}", message, e);
                 // Ignore invalid message
             } catch (Exception e) {
-                logger.debug("Received message not added to SOLR: {}", message, e);
+                logger.warn("Received message not added to SOLR: {}", message, e);
                 // Trouble adding solr document. Ignore
             }
         }
