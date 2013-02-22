@@ -1,6 +1,7 @@
 
 package org.fcrepo.services;
 
+import static org.fcrepo.services.ObjectService.getObjectNode;
 import static org.fcrepo.utils.FedoraJcrTypes.DC_IDENTIFER;
 import static org.fcrepo.utils.FedoraJcrTypes.FEDORA_DATASTREAM;
 import static org.fcrepo.utils.FedoraJcrTypes.FEDORA_OWNED;
@@ -13,13 +14,17 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.Calendar;
 
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import javax.inject.Inject;
 import javax.jcr.Node;
+import javax.jcr.PathNotFoundException;
 import javax.jcr.Property;
 import javax.jcr.Repository;
 import javax.jcr.RepositoryException;
 import javax.jcr.Session;
 
+import org.fcrepo.Datastream;
 import org.modeshape.jcr.api.JcrTools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,11 +37,11 @@ public class DatastreamService {
     @Inject
     private Repository repo;
 
-    private JcrTools jcrTools = new JcrTools();
-
     private Session readOnlySession;
 
-    public Node createDatastreamNode(final Session session,
+    private static JcrTools jcrTools = new JcrTools(false);
+
+    public static Node createDatastreamNode(final Session session,
             final String dsPath, final String contentType,
             final InputStream requestBodyStream) throws RepositoryException,
             IOException {
@@ -84,9 +89,33 @@ public class DatastreamService {
         return ds;
     }
 
-    public InputStream getDatastreamContentInputStream(final Session session,
-            final String dsPath) throws RepositoryException {
-        return session.getNode(dsPath).getNode(JCR_CONTENT).getProperty(
-                JCR_DATA).getBinary().getStream();
+    public static Node getDatastreamNode(final String pid, final String dsId)
+            throws PathNotFoundException, RepositoryException {
+        logger.trace("Executing getDatastreamNode() with pid: " + pid +
+                " and dsId: " + dsId);
+        final Node objNode = getObjectNode(pid);
+        logger.trace("Retrieved object node: " + objNode.getName());
+        final Node dsNode = objNode.getNode(dsId);
+        logger.trace("Retrieved datastream node: " + dsNode.getName());
+        return dsNode;
+    }
+
+    public static Datastream getDatastream(final String pid, final String dsId)
+            throws PathNotFoundException, RepositoryException {
+        return new Datastream(getObjectNode(pid).getNode(dsId));
+    }
+
+    @PostConstruct
+    public void getSession() {
+        try {
+            readOnlySession = repo.login();
+        } catch (RepositoryException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    @PreDestroy
+    public void logoutSession() {
+        readOnlySession.logout();
     }
 }

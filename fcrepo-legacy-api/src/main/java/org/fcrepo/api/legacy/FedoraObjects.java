@@ -2,31 +2,28 @@
 package org.fcrepo.api.legacy;
 
 import static com.google.common.base.Joiner.on;
-import static com.google.common.collect.Collections2.transform;
-import static com.google.common.collect.ImmutableSet.copyOf;
 import static javax.ws.rs.core.MediaType.APPLICATION_JSON;
 import static javax.ws.rs.core.MediaType.TEXT_XML;
 import static javax.ws.rs.core.Response.created;
 import static javax.ws.rs.core.Response.ok;
-import static javax.ws.rs.core.Response.status;
-import static javax.ws.rs.core.Response.Status.CONFLICT;
 import static org.fcrepo.api.legacy.FedoraDatastreams.getContentSize;
 import static org.fcrepo.jaxb.responses.ObjectProfile.ObjectStates.A;
+import static org.fcrepo.services.ObjectService.createObjectNode;
+import static org.fcrepo.services.ObjectService.getObjectNames;
+import static org.fcrepo.services.ObjectService.getObjectNode;
+import static org.fcrepo.services.PathService.getObjectJcrNodePath;
 import static org.fcrepo.utils.FedoraJcrTypes.DC_TITLE;
+import static org.fcrepo.utils.FedoraTypesUtils.map;
+import static org.fcrepo.utils.FedoraTypesUtils.nodetype2name;
+import static org.fcrepo.utils.FedoraTypesUtils.value2string;
 
 import java.io.IOException;
-import java.util.Collection;
 
-import javax.annotation.PostConstruct;
-import javax.annotation.PreDestroy;
-import javax.jcr.LoginException;
 import javax.jcr.Node;
 import javax.jcr.NodeIterator;
 import javax.jcr.Property;
 import javax.jcr.RepositoryException;
 import javax.jcr.Session;
-import javax.jcr.Value;
-import javax.jcr.nodetype.NodeType;
 import javax.ws.rs.Consumes;
 import javax.ws.rs.DELETE;
 import javax.ws.rs.GET;
@@ -39,12 +36,8 @@ import javax.ws.rs.core.Response;
 
 import org.fcrepo.AbstractResource;
 import org.fcrepo.jaxb.responses.ObjectProfile;
-import org.fcrepo.services.ObjectService;
-import org.modeshape.common.SystemFailureException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import com.google.common.base.Function;
 
 @Path("/objects")
 public class FedoraObjects extends AbstractResource {
@@ -52,65 +45,65 @@ public class FedoraObjects extends AbstractResource {
     private static final Logger logger = LoggerFactory
             .getLogger(FedoraObjects.class);
 
-    private Session readOnlySession;
-
-    @PostConstruct
-    public void loginReadOnlySession() throws LoginException,
-            RepositoryException {
-        readOnlySession = repo.login();
-    }
-
-    @PreDestroy
-    public void logoutReadOnlySession() {
-        readOnlySession.logout();
-    }
-
+    /**
+     * 
+     * Provides a serialized list of JCR names for all objects in the repo.
+     * 
+     * @return 200
+     * @throws RepositoryException
+     */
     @GET
     public Response getObjects() throws RepositoryException {
 
-        Node objects = readOnlySession.getNode("/objects");
-        StringBuffer nodes = new StringBuffer();
-
-        for (NodeIterator i = objects.getNodes(); i.hasNext();) {
-            Node n = i.nextNode();
-            nodes.append("Name: " + n.getName() + ", Path:" + n.getPath() +
-                    "\n");
-        }
-        return ok(nodes.toString()).build();
+        return ok(getObjectNames().toString()).build();
 
     }
 
+    /**
+     * Creates a new object with a repo-chosen PID
+     * 
+     * @return 201
+     * @throws RepositoryException
+     */
     @POST
     @Path("/new")
     public Response ingestAndMint() throws RepositoryException {
         return ingest(pidMinter.mintPid());
     }
 
+    /**
+     * Does nothing yet-- must be improved to handle the FCREPO3 PUT to /objects/{pid}
+     * 
+     * @param pid
+     * @return 201
+     * @throws RepositoryException
+     */
     @PUT
     @Path("/{pid}")
     @Consumes({TEXT_XML, APPLICATION_JSON})
     public Response modify(@PathParam("pid")
-    final String pid, final ObjectProfile objProfile)
-            throws RepositoryException {
-
-        final String objPath = "/objects/" + pid;
-        final Session session = repo.login();
-
-        if (!session.nodeExists(objPath)) {
-            session.logout();
-            return status(CONFLICT).entity("No such object").build();
-        }
-        final Node obj = session.getNode(objPath);
-        obj.setProperty(DC_TITLE, objProfile.objLabel);
-        if (objProfile.objModels != null)
-            for (String model : objProfile.objModels) {
-                obj.addMixin(model);
-            }
-        session.save();
-        session.logout();
+    final String pid) throws RepositoryException {
+        /*
+         * final String objPath = "/objects/" + pid;
+         * final Session session = repo.login();
+         * try {
+         * final Node obj = session.getNode(objPath);
+         * // TODO do something with awful mess of fcrepo3 query params
+         * session.save();
+         * } finally {
+         * session.logout();
+         * }
+         */
         return created(uriInfo.getAbsolutePath()).build();
     }
 
+    /**
+     * Creates a new object.
+     * 
+     * @param pid
+     * @return 201
+     * @throws RepositoryException
+     */
     @POST
     @Path("/{pid}")
     public Response ingest(@PathParam("pid")
@@ -119,12 +112,8 @@ public class FedoraObjects extends AbstractResource {
         logger.debug("Attempting to ingest with pid: " + pid);
 
         final Session session = repo.login();
-
-        if (session.hasPermission("/objects/" + pid, "add_node")) {
-            final Node obj =
-                    new ObjectService().createObjectNode(session, "/objects/" +
-                            pid);
-
+        try {
+            final Node obj = createObjectNode(session, pid);
             session.save();
             /*
              * we save before updating the repo size because the act of
@@ -134,62 +123,69 @@ public class FedoraObjects extends AbstractResource {
             updateRepositorySize(getObjectSize(obj), session);
             // now we save again to persist the repo size
             session.save();
-            session.logout();
             logger.debug("Finished ingest with pid: " + pid);
             return created(uriInfo.getAbsolutePath()).entity(pid).build();
-        } else {
+
+        } finally {
             session.logout();
-            return four03;
         }
     }
 
+    /**
+     * Returns an object profile.
+     * 
+     * @param pid
+     * @return 200
+     * @throws RepositoryException
+     * @throws IOException
+     */
     @GET
     @Path("/{pid}")
     @Produces({TEXT_XML, APPLICATION_JSON})
-    public Response getObject(@PathParam("pid")
+    public ObjectProfile getObject(@PathParam("pid")
     final String pid) throws RepositoryException, IOException {
 
-        if (readOnlySession.nodeExists("/objects/" + pid)) {
+        final Node obj = getObjectNode(pid);
+        final ObjectProfile objectProfile = new ObjectProfile();
 
-            final Node obj = readOnlySession.getNode("/objects/" + pid);
-            final ObjectProfile objectProfile = new ObjectProfile();
-
-            objectProfile.pid = pid;
-            if (obj.hasProperty(DC_TITLE)) {
-                Property dcTitle = obj.getProperty(DC_TITLE);
-                if (!dcTitle.isMultiple())
-                    objectProfile.objLabel =
-                            obj.getProperty(DC_TITLE).getString();
-                else {
-                    objectProfile.objLabel =
-                            on('/').join(map(dcTitle.getValues(), value2string));
-                }
+        objectProfile.pid = pid;
+        if (obj.hasProperty(DC_TITLE)) {
+            Property dcTitle = obj.getProperty(DC_TITLE);
+            if (!dcTitle.isMultiple())
+                objectProfile.objLabel = obj.getProperty(DC_TITLE).getString();
+            else {
+                objectProfile.objLabel =
+                        on('/').join(map(dcTitle.getValues(), value2string));
             }
-            objectProfile.objOwnerId =
-                    obj.getProperty("fedora:ownerId").getString();
-            objectProfile.objCreateDate =
-                    obj.getProperty("jcr:created").getString();
-            objectProfile.objLastModDate =
-                    obj.getProperty("jcr:lastModified").getString();
-            objectProfile.objSize = getObjectSize(obj);
-            objectProfile.objItemIndexViewURL =
-                    uriInfo.getAbsolutePathBuilder().path("datastreams")
-                            .build();
-            objectProfile.objState = A;
-            objectProfile.objModels =
-                    map(obj.getMixinNodeTypes(), nodetype2string);
-            return ok(objectProfile).build();
-        } else {
-            return four04;
         }
+        objectProfile.objOwnerId =
+                obj.getProperty("fedora:ownerId").getString();
+        objectProfile.objCreateDate =
+                obj.getProperty("jcr:created").getString();
+        objectProfile.objLastModDate =
+                obj.getProperty("jcr:lastModified").getString();
+        objectProfile.objSize = getObjectSize(obj);
+        objectProfile.objItemIndexViewURL =
+                uriInfo.getAbsolutePathBuilder().path("datastreams").build();
+        objectProfile.objState = A;
+        objectProfile.objModels = map(obj.getMixinNodeTypes(), nodetype2name);
+        return objectProfile;
+
     }
 
+    /**
+     * Deletes an object.
+     * 
+     * @param pid
+     * @return
+     * @throws RepositoryException
+     */
     @DELETE
     @Path("/{pid}")
     public Response deleteObject(@PathParam("pid")
     final String pid) throws RepositoryException {
         final Session session = repo.login();
-        final Node obj = session.getNode("/objects/" + pid);
+        final Node obj = session.getNode(getObjectJcrNodePath(pid));
         updateRepositorySize(0L - getObjectSize(obj), session);
         return deleteResource(obj);
     }
@@ -219,32 +215,4 @@ public class FedoraObjects extends AbstractResource {
         return size;
     }
 
-    private Function<Value, String> value2string =
-            new Function<Value, String>() {
-
-                @Override
-                public String apply(Value v) {
-                    try {
-                        return v.getString();
-                    } catch (RepositoryException e) {
-                        throw new SystemFailureException(e);
-                    } catch (IllegalStateException e) {
-                        throw new SystemFailureException(e);
-                    }
-                }
-            };
-
-    private static <From, To> Collection<To> map(From[] input,
-            Function<From, To> f) {
-        return transform(copyOf(input), f);
-    }
-
-    private Function<NodeType, String> nodetype2string =
-            new Function<NodeType, String>() {
-
-                @Override
-                public String apply(NodeType type) {
-                    return type.getName();
-                }
-            };
 }

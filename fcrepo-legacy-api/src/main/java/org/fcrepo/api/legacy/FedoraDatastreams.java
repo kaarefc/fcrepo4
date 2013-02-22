@@ -7,20 +7,21 @@ import static javax.ws.rs.core.MediaType.APPLICATION_JSON;
 import static javax.ws.rs.core.MediaType.APPLICATION_OCTET_STREAM_TYPE;
 import static javax.ws.rs.core.MediaType.TEXT_XML;
 import static javax.ws.rs.core.Response.created;
-import static javax.ws.rs.core.Response.notAcceptable;
 import static javax.ws.rs.core.Response.ok;
 import static org.fcrepo.api.legacy.FedoraObjects.getObjectSize;
 import static org.fcrepo.jaxb.responses.DatastreamProfile.DatastreamStates.A;
+import static org.fcrepo.services.DatastreamService.createDatastreamNode;
+import static org.fcrepo.services.ObjectService.getObjectNode;
+import static org.fcrepo.services.PathService.getDatastreamJcrNodePath;
+import static org.fcrepo.services.PathService.getObjectJcrNodePath;
 import static org.modeshape.jcr.api.JcrConstants.JCR_CONTENT;
 import static org.modeshape.jcr.api.JcrConstants.JCR_DATA;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
+import java.util.List;
 
-import javax.annotation.PostConstruct;
-import javax.annotation.PreDestroy;
-import javax.jcr.LoginException;
 import javax.jcr.Node;
 import javax.jcr.NodeIterator;
 import javax.jcr.PathNotFoundException;
@@ -38,11 +39,13 @@ import javax.ws.rs.Produces;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
 
+import org.apache.cxf.jaxrs.ext.multipart.Attachment;
 import org.fcrepo.AbstractResource;
+import org.fcrepo.Datastream;
 import org.fcrepo.jaxb.responses.DatastreamHistory;
 import org.fcrepo.jaxb.responses.DatastreamProfile;
 import org.fcrepo.jaxb.responses.ObjectDatastreams;
-import org.fcrepo.jaxb.responses.ObjectDatastreams.Datastream;
+import org.fcrepo.jaxb.responses.ObjectDatastreams.DatastreamElement;
 import org.fcrepo.services.DatastreamService;
 import org.modeshape.jcr.api.Binary;
 import org.slf4j.Logger;
@@ -55,19 +58,6 @@ public class FedoraDatastreams extends AbstractResource {
 
     final private Logger logger = LoggerFactory
             .getLogger(FedoraDatastreams.class);
-
-    private Session readOnlySession;
-
-    @PostConstruct
-    public void loginReadOnlySession() throws LoginException,
-            RepositoryException {
-        readOnlySession = repo.login();
-    }
-
-    @PreDestroy
-    public void logoutReadOnlySession() {
-        readOnlySession.logout();
-    }
 
     /**
      * Returns a list of datastreams for the object
@@ -83,25 +73,59 @@ public class FedoraDatastreams extends AbstractResource {
     @GET
     @Path("/")
     @Produces({TEXT_XML, APPLICATION_JSON})
-    public Response getDatastreams(@PathParam("pid")
+    public ObjectDatastreams getDatastreams(@PathParam("pid")
     final String pid) throws RepositoryException, IOException {
 
-        if (readOnlySession.nodeExists("/objects/" + pid)) {
-            final ObjectDatastreams objectDatastreams = new ObjectDatastreams();
-            final Builder<Datastream> datastreams = builder();
+        final ObjectDatastreams objectDatastreams = new ObjectDatastreams();
+        final Builder<DatastreamElement> datastreams = builder();
 
-            NodeIterator i =
-                    readOnlySession.getNode("/objects/" + pid).getNodes();
-            while (i.hasNext()) {
-                final Node ds = i.nextNode();
-                datastreams.add(new Datastream(ds.getName(), ds.getName(),
-                        getDSMimeType(ds)));
-            }
-            objectDatastreams.datastreams = datastreams.build();
-            return ok(objectDatastreams).build();
-        } else {
-            return four04;
+        NodeIterator i = getObjectNode(pid).getNodes();
+        while (i.hasNext()) {
+            final Node ds = i.nextNode();
+            datastreams.add(new DatastreamElement(ds.getName(), ds.getName(),
+                    getDSMimeType(ds)));
         }
+        objectDatastreams.datastreams = datastreams.build();
+        return objectDatastreams;
+
+    }
+
+    @POST
+    @Path("/")
+    public Response addDatastreams(@PathParam("pid")
+    final String pid, final List<Attachment> attachmentList)
+            throws RepositoryException, IOException {
+
+        final Session session = repo.login();
+        try {
+            Long oldObjectSize =
+                    getObjectSize(session.getNode(getObjectJcrNodePath(pid)));
+
+            for (final Attachment a : attachmentList) {
+                final String dsid =
+                        a.getContentDisposition().getParameter("name");
+                final String dsPath = getDatastreamJcrNodePath(pid, dsid);
+                createDatastreamNode(session, dsPath, a.getDataHandler()
+                        .getContentType(), a.getDataHandler().getInputStream());
+
+            }
+            session.save();
+
+            /*
+             * we save before updating the repo size because the act of
+             * persisting session state creates new system-curated nodes and
+             * properties which contribute to the footprint of this resource
+             */
+            updateRepositorySize(getObjectSize(session
+                    .getNode(getObjectJcrNodePath(pid))) -
+                    oldObjectSize, session);
+            // now we save again to persist the repo size
+            session.save();
+        } finally {
+            session.logout();
+        }
+
+        return created(uriInfo.getAbsolutePath()).build();
     }
 
     /**
@@ -131,36 +155,20 @@ public class FedoraDatastreams extends AbstractResource {
         contentType =
                 contentType != null ? contentType
                         : APPLICATION_OCTET_STREAM_TYPE;
-        String dspath = "/objects/" + pid + "/" + dsid;
+        String dspath = getDatastreamJcrNodePath(pid, dsid);
 
-        if (!session.nodeExists("/objects/" + pid)) {
-            logger.debug("Tried to create a datastream for an object that doesn't exist, at resource path: " +
-                    dspath);
-            return notAcceptable(null).build();
-        }
-
-        if (session.hasPermission(dspath, "add_node")) {
-            if (!session.nodeExists(dspath)) {
-                return created(
-                        addDatastreamNode(pid, dspath, contentType,
-                                requestBodyStream, session)).build();
-            } else {
-                if (session.hasPermission(dspath, "remove")) {
-                    session.getNode(dspath).remove();
-                    session.save();
-                    return created(
-                            addDatastreamNode(pid, dspath, contentType,
-                                    requestBodyStream, session)).build();
-
-                } else {
-                    session.logout();
-                    return four03;
-                }
-            }
+        if (!session.nodeExists(dspath)) {
+            return created(
+                    addDatastreamNode(pid, dspath, contentType,
+                            requestBodyStream, session)).build();
         } else {
-            session.logout();
-            return four03;
+            session.getNode(dspath).remove();
+            session.save();
+            return created(
+                    addDatastreamNode(pid, dspath, contentType,
+                            requestBodyStream, session)).build();
         }
+
     }
 
     /**
@@ -186,48 +194,44 @@ public class FedoraDatastreams extends AbstractResource {
     MediaType contentType, InputStream requestBodyStream)
             throws RepositoryException, IOException {
         final Session session = repo.login();
-
         contentType =
                 contentType != null ? contentType
-                        : MediaType.APPLICATION_OCTET_STREAM_TYPE;
-        String dspath = "/objects/" + pid + "/" + dsid;
+                        : APPLICATION_OCTET_STREAM_TYPE;
+        String dspath = getDatastreamJcrNodePath(pid, dsid);
 
-        if (session.hasPermission(dspath, "add_node")) {
-            return Response.created(
-                    addDatastreamNode(pid, dspath, contentType,
-                            requestBodyStream, session)).build();
-        } else {
-            session.logout();
-            return four03;
-        }
+        return created(
+                addDatastreamNode(pid, dspath, contentType, requestBodyStream,
+                        session)).build();
+
     }
 
     private URI addDatastreamNode(final String pid, final String dsPath,
             final MediaType contentType, final InputStream requestBodyStream,
             final Session session) throws RepositoryException, IOException {
 
-        Long oldObjectSize = getObjectSize(session.getNode("/objects/" + pid));
+        Long oldObjectSize =
+                getObjectSize(session.getNode(getObjectJcrNodePath(pid)));
         logger.debug("Attempting to add datastream node at path: " + dsPath);
-
-        boolean created = session.nodeExists(dsPath);
-
-        new DatastreamService().createDatastreamNode(session, dsPath,
-                contentType.toString(), requestBodyStream);
-
-        session.save();
-        if (created) {
-            /*
-             * we save before updating the repo size because the act of
-             * persisting session state creates new system-curated nodes and
-             * properties which contribute to the footprint of this resource
-             */
-            updateRepositorySize(getObjectSize(session.getNode("/objects/" +
-                    pid)) -
-                    oldObjectSize, session);
-            // now we save again to persist the repo size
+        try {
+            boolean created = session.nodeExists(dsPath);
+            createDatastreamNode(session, dsPath, contentType.toString(),
+                    requestBodyStream);
             session.save();
+            if (created) {
+                /*
+                 * we save before updating the repo size because the act of
+                 * persisting session state creates new system-curated nodes and
+                 * properties which contribute to the footprint of this resource
+                 */
+                updateRepositorySize(getObjectSize(session
+                        .getNode(getObjectJcrNodePath(pid))) -
+                        oldObjectSize, session);
+                // now we save again to persist the repo size
+                session.save();
+            }
+        } finally {
+            session.logout();
         }
-        session.logout();
         logger.debug("Finished adding datastream node at path: " + dsPath);
         return uriInfo.getAbsolutePath();
     }
@@ -247,23 +251,14 @@ public class FedoraDatastreams extends AbstractResource {
     @GET
     @Path("/{dsid}")
     @Produces({TEXT_XML, APPLICATION_JSON})
-    public Response getDatastream(@PathParam("pid")
+    public DatastreamProfile getDatastream(@PathParam("pid")
     final String pid, @PathParam("dsid")
-    final String dsid) throws RepositoryException, IOException {
+    final String dsId) throws RepositoryException, IOException {
+        logger.trace("Executing getDatastream() with dsId: " + dsId);
+        Datastream ds = DatastreamService.getDatastream(pid, dsId);
+        logger.debug("Retrieved dsNode: " + ds.getNode().getName());
+        return getDSProfile(ds);
 
-        if (!readOnlySession.nodeExists("/objects/" + pid)) {
-            return four04;
-        }
-
-        final Node obj = readOnlySession.getNode("/objects/" + pid);
-
-        if (obj.hasNode(dsid)) {
-            final Node ds = obj.getNode(dsid);
-            final DatastreamProfile dsProfile = getDSProfile(ds);
-            return ok(dsProfile).build();
-        } else {
-            return four04;
-        }
     }
 
     /**
@@ -282,21 +277,8 @@ public class FedoraDatastreams extends AbstractResource {
     final String pid, @PathParam("dsid")
     final String dsid) throws RepositoryException {
 
-        final String dsPath = "/objects/" + pid + "/" + dsid;
-
-        if (readOnlySession.nodeExists(dsPath)) {
-            final Node ds = readOnlySession.getNode(dsPath);
-            final String mimeType =
-                    ds.hasProperty("fedora:contentType") ? ds.getProperty(
-                            "fedora:contentType").getString()
-                            : "application/octet-stream";
-            final InputStream responseStream =
-                    ds.getNode(JCR_CONTENT).getProperty(JCR_DATA).getBinary()
-                            .getStream();
-            return ok(responseStream, mimeType).build();
-        } else {
-            return four04;
-        }
+        final Datastream ds = DatastreamService.getDatastream(pid, dsid);
+        return ok(ds.getContent(), ds.getMimeType()).build();
     }
 
     /**
@@ -304,7 +286,7 @@ public class FedoraDatastreams extends AbstractResource {
      * 
      * @param pid
      *            persistent identifier of the digital object
-     * @param dsid
+     * @param dsId
      *            datastream identifier
      * @return 200
      * @throws RepositoryException
@@ -316,22 +298,16 @@ public class FedoraDatastreams extends AbstractResource {
     @Produces({TEXT_XML, APPLICATION_JSON})
     // TODO implement this after deciding on a versioning model
             public
-            Response getDatastreamHistory(@PathParam("pid")
+            DatastreamHistory getDatastreamHistory(@PathParam("pid")
             final String pid, @PathParam("dsid")
-            final String dsid) throws RepositoryException, IOException {
+            final String dsId) throws RepositoryException, IOException {
 
-        final String dsPath = "/objects/" + pid + "/" + dsid;
-
-        if (readOnlySession.nodeExists(dsPath)) {
-            final Node ds = readOnlySession.getNode(dsPath);
-            final DatastreamHistory dsHistory =
-                    new DatastreamHistory(singletonList(getDSProfile(ds)));
-            dsHistory.dsID = dsid;
-            dsHistory.pid = pid;
-            return ok(dsHistory).build();
-        } else {
-            return four04;
-        }
+        final Datastream ds = DatastreamService.getDatastream(pid, dsId);
+        final DatastreamHistory dsHistory =
+                new DatastreamHistory(singletonList(getDSProfile(ds)));
+        dsHistory.dsID = dsId;
+        dsHistory.pid = pid;
+        return dsHistory;
     }
 
     /**
@@ -353,7 +329,7 @@ public class FedoraDatastreams extends AbstractResource {
     @Path("/{dsid}/history")
     @Produces(TEXT_XML)
     @Deprecated
-    public Response getDatastreamHistoryOld(@PathParam("pid")
+    public DatastreamHistory getDatastreamHistoryOld(@PathParam("pid")
     final String pid, @PathParam("dsid")
     final String dsid) throws RepositoryException, IOException {
         return getDatastreamHistory(pid, dsid);
@@ -374,31 +350,30 @@ public class FedoraDatastreams extends AbstractResource {
     public Response deleteDatastream(@PathParam("pid")
     String pid, @PathParam("dsid")
     String dsid) throws RepositoryException {
-        final String dsPath = "/objects/" + pid + "/" + dsid;
+        final String dsPath = getDatastreamJcrNodePath(pid, dsid);
         final Session session = repo.login();
-        final Node ds;
-        if (session.nodeExists(dsPath)) {
-            ds = session.getNode(dsPath);
-        } else {
-            return four04;
-        }
+        final Node ds = session.getNode(dsPath);
         updateRepositorySize(0L - getDatastreamSize(ds), session);
         return deleteResource(ds);
     }
 
-    private DatastreamProfile getDSProfile(Node ds) throws RepositoryException,
-            IOException {
+    private DatastreamProfile getDSProfile(Datastream ds)
+            throws RepositoryException, IOException {
+        logger.trace("Executing getDSProfile() with node: " + ds.getDsId());
         final DatastreamProfile dsProfile = new DatastreamProfile();
-        dsProfile.dsID = ds.getName();
-        dsProfile.pid = ds.getParent().getName();
-        dsProfile.dsLabel = ds.getName();
+        dsProfile.dsID = ds.getDsId();
+        dsProfile.pid = ds.getObject().getName();
+        logger.trace("Retrieved datastream " + ds.getDsId() + "'s parent: " +
+                dsProfile.pid);
+        dsProfile.dsLabel = ds.getLabel();
+        logger.trace("Retrieved datastream " + ds.getDsId() + "'s label: " +
+                ds.getLabel());
         dsProfile.dsState = A;
-        dsProfile.dsMIME = getDSMimeType(ds);
+        dsProfile.dsMIME = ds.getMimeType();
         dsProfile.dsSize =
-                getNodePropertySize(ds) +
-                        ds.getNode(JCR_CONTENT).getProperty(JCR_DATA)
-                                .getBinary().getSize();
-        dsProfile.dsCreateDate = ds.getProperty("jcr:created").getString();
+                getNodePropertySize(ds.getNode()) + ds.getContentSize();
+        dsProfile.dsCreateDate =
+                ds.getNode().getProperty("jcr:created").getString();
         return dsProfile;
     }
 
